@@ -3,10 +3,12 @@ import requests
 import hashlib
 import json
 import os
+import re  # 导入 re 模块
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import folder_paths
 import time
+
 
 class BaseCivitaiPromptStatsNode:
     """
@@ -46,17 +48,57 @@ class BaseCivitaiPromptStatsNode:
     FUNCTION = "execute"
     CATEGORY = "Civitai"
 
+    # PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-    CACHE_DIR = os.path.join(PROJECT_ROOT,"data")
+    CACHE_DIR = os.path.join(PROJECT_ROOT, "data")
     os.makedirs(CACHE_DIR, exist_ok=True)
+    HASH_CACHE_FILE = os.path.join(CACHE_DIR, "hash_cache.json")
 
     @staticmethod
     def calculate_sha256(file_path):
+        """计算文件的 SHA256 哈希"""
+        print(f"[{__class__.__name__}] Calculating SHA256 for: {os.path.basename(file_path)}...")
+        start_time = time.time()
         sha256_hash = hashlib.sha256()
         with open(file_path, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
                 sha256_hash.update(chunk)
-        return sha256_hash.hexdigest()
+        digest = sha256_hash.hexdigest()
+        duration = time.time() - start_time
+        print(f"[{__class__.__name__}] SHA256 calculated in {duration:.2f} seconds.")
+        return digest
+
+    def get_cached_sha256(self, file_path):
+        """
+        获取文件的 SHA256 哈希，优先从缓存读取。
+        缓存键基于文件路径、修改时间和大小。
+        """
+        try:
+            mtime = os.path.getmtime(file_path)
+            size = os.path.getsize(file_path)
+            cache_key = f"{file_path}|{mtime}|{size}"
+
+            try:
+                with open(self.HASH_CACHE_FILE, "r", encoding="utf-8") as f:
+                    hash_cache = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                hash_cache = {}
+
+            if cache_key in hash_cache:
+                print(f"[{self.__class__.__name__}] Loaded hash from cache for: {os.path.basename(file_path)}")
+                return hash_cache[cache_key]
+
+            file_hash = self.calculate_sha256(file_path)
+            hash_cache[cache_key] = file_hash
+
+            with open(self.HASH_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(hash_cache, f, indent=2)
+
+            return file_hash
+        except Exception as e:
+            print(f"[{self.__class__.__name__}] Error handling hash cache: {e}")
+            # Fallback to direct calculation if caching fails
+            return self.calculate_sha256(file_path)
 
     @staticmethod
     def _get_model_version_info_by_hash(sha256_hash, timeout=10):
@@ -71,6 +113,19 @@ class BaseCivitaiPromptStatsNode:
         resp = requests.get(url, params=params, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
+
+    @staticmethod
+    def _parse_prompts(prompt_text: str):
+        """
+        增强的提示词解析器，可以处理带权重的词组、LoRA等。
+        例如：(masterpiece:1.2), <lora:name:1>, [word1|word2]
+        """
+        if not isinstance(prompt_text, str) or not prompt_text.strip():
+            return []
+        # 正则表达式：匹配 <...>、[...]、(...) 或被逗号分隔的普通词组
+        pattern = re.compile(r"<[^>]+>|\[[^\]]+\]|\([^)]+\)|[^,]+")
+        tags = pattern.findall(prompt_text)
+        return [tag.strip() for tag in tags if tag.strip()]
 
     def _format_tags_with_counts(self, items, top_n):
         """
@@ -97,20 +152,29 @@ class BaseCivitaiPromptStatsNode:
             print(f"[{self.__class__.__name__}] 本地文件未找到: {file_path}")
             return ("", "")
 
-        # compute file hash
+        # 优化1: 优先从缓存获取文件哈希
         try:
-            file_hash = self.calculate_sha256(file_path)
+            file_hash = self.get_cached_sha256(file_path)
         except Exception as e:
-            print(f"[{self.__class__.__name__}] 计算文件 hash 失败: {e}")
+            print(f"[{self.__class__.__name__}] 计算或获取文件 hash 失败: {e}")
             return ("", "")
 
-        cache_file = os.path.join(self.CACHE_DIR, f"{file_hash}_{sort}_{max_pages}_{top_n}.json")
+        # 优化2: 优化缓存键，移除 top_n
+        cache_file = os.path.join(self.CACHE_DIR, f"{file_hash}_{sort}_{max_pages}.json")
         if force_refresh == "no" and os.path.exists(cache_file):
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
-                    cached = json.load(f)
-                return (cached.get("positive_text",""), cached.get("negative_text",""))
-            except Exception:
+                    cached_data = json.load(f)
+                pos_counts = cached_data.get("pos_counts", [])
+                neg_counts = cached_data.get("neg_counts", [])
+
+                # 直接使用缓存数据进行格式化输出
+                pos_text = self._format_tags_with_counts(pos_counts, top_n)
+                neg_text = self._format_tags_with_counts(neg_counts, top_n)
+                print(f"[{self.__class__.__name__}] Loaded prompt stats from cache: {os.path.basename(cache_file)}")
+                return (pos_text, neg_text)
+            except Exception as e:
+                print(f"[{self.__class__.__name__}] Failed to load from cache, fetching new data. Error: {e}")
                 pass
 
         # step1: get model version via hash
@@ -135,6 +199,7 @@ class BaseCivitaiPromptStatsNode:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for p in pages:
+
                 def make_task(page_num):
                     attempt = 0
                     while True:
@@ -169,20 +234,23 @@ class BaseCivitaiPromptStatsNode:
                         continue
                     prompt = meta.get("prompt") or ""
                     negprompt = meta.get("negativePrompt") or ""
-                    if isinstance(prompt, str) and prompt.strip():
-                        pos_tokens.extend([t.strip() for t in prompt.split(",") if t.strip()])
-                    if isinstance(negprompt, str) and negprompt.strip():
-                        neg_tokens.extend([t.strip() for t in negprompt.split(",") if t.strip()])
+
+                    # 优化3: 使用增强的解析器
+                    pos_tokens.extend(self._parse_prompts(prompt))
+                    neg_tokens.extend(self._parse_prompts(negprompt))
 
         pos_counts = Counter(pos_tokens).most_common()
         neg_counts = Counter(neg_tokens).most_common()
 
+        # 格式化输出
         pos_text = self._format_tags_with_counts(pos_counts, top_n)
         neg_text = self._format_tags_with_counts(neg_counts, top_n)
 
+        # 优化2: 缓存原始统计数据而非格式化文本
         try:
             with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump({"positive_text": pos_text, "negative_text": neg_text}, f, ensure_ascii=False, indent=2)
+                cache_content = {"pos_counts": pos_counts, "neg_counts": neg_counts}
+                json.dump(cache_content, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[{self.__class__.__name__}] 保存缓存失败: {e}")
 
