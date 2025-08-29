@@ -1,27 +1,59 @@
-from inspect import cleandoc
 import requests
 import hashlib
 import json
 import os
-import re  # 导入 re 模块
+import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import folder_paths
 import time
 
+# --- Utility Functions (These remain the same) ---
+
+def get_metadata(filepath, type):
+    """Extracts metadata from a safetensors file."""
+    filepath = folder_paths.get_full_path(type, filepath)
+    if not filepath:
+        return None
+    try:
+        with open(filepath, "rb") as file:
+            header_size = int.from_bytes(file.read(8), "little", signed=False)
+            if header_size <= 0:
+                return None
+            header = file.read(header_size)
+            header_json = json.loads(header)
+            return header_json.get("__metadata__")
+    except Exception as e:
+        print(f"[Civitai Prompt Stats] Error reading metadata: {e}")
+        return None
+
+def sort_tags_by_frequency(meta_tags):
+    """Parses the __metadata__ json looking for trained tags and sorts them by frequency."""
+    if not meta_tags or "ss_tag_frequency" not in meta_tags:
+        return []
+    try:
+        tag_freq_json = json.loads(meta_tags["ss_tag_frequency"])
+        tag_counts = Counter()
+        for _, dataset in tag_freq_json.items():
+            for tag, count in dataset.items():
+                tag_counts[str(tag).strip()] += count
+        sorted_tags = [tag for tag, _ in tag_counts.most_common()]
+        return sorted_tags
+    except Exception as e:
+        print(f"[Civitai Prompt Stats] Error parsing tag frequency: {e}")
+        return []
+
+# --- Refactored Base Class ---
 
 class BaseCivitaiPromptStatsNode:
     """
-    Base Civitai Prompt Stats Node
-    提供通用逻辑：file -> hash -> model-version -> images
-    子类只需定义 FOLDER_KEY 即可
+    Base class containing common logic to fetch community prompts from Civitai.
+    It does NOT handle trigger words, as that is specific to certain model types.
     """
 
-    FOLDER_KEY = None  # 由子类定义 ("checkpoints" / "loras")
+    FOLDER_KEY = None
 
-    def __init__(self):
-        pass
-
+    # Base class only defines the common inputs
     @classmethod
     def INPUT_TYPES(cls):
         try:
@@ -29,34 +61,36 @@ class BaseCivitaiPromptStatsNode:
         except Exception:
             files = []
         file_list = sorted(files, key=str.lower) if files else [""]
-
         return {
             "required": {
-                "file_name": (file_list, {"default": file_list[0], "tooltip": f"选择{cls.FOLDER_KEY}文件"}),
+                "file_name": (file_list, {}),
                 "top_n": ("INT", {"default": 20, "min": 1, "max": 200}),
                 "max_pages": ("INT", {"default": 3, "min": 1, "max": 50}),
-                "sort": (["Most Reactions", "Most Comments", "Newest"], {"default": "Most Reactions"}),
+                "sort": (
+                    ["Most Reactions", "Most Comments", "Newest"],
+                    {"default": "Most Reactions"},
+                ),
                 "timeout": ("INT", {"default": 10, "min": 1, "max": 60}),
                 "retries": ("INT", {"default": 2, "min": 0, "max": 5}),
                 "force_refresh": (["no", "yes"], {"default": "no"}),
             }
         }
 
+    # Base class only defines the common outputs
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("positive_prompt", "negative_prompt")
-    DESCRIPTION = cleandoc(__doc__)
     FUNCTION = "execute"
     CATEGORY = "Civitai"
 
-    # PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    # --- Caching and Helper Methods (can be used by subclasses) ---
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
     CACHE_DIR = os.path.join(PROJECT_ROOT, "data")
     os.makedirs(CACHE_DIR, exist_ok=True)
     HASH_CACHE_FILE = os.path.join(CACHE_DIR, "hash_cache.json")
+    CIVITAI_TRIGGERS_CACHE = os.path.join(CACHE_DIR, "civitai_triggers_cache.json")
 
     @staticmethod
     def calculate_sha256(file_path):
-        """计算文件的 SHA256 哈希"""
         print(f"[{__class__.__name__}] Calculating SHA256 for: {os.path.basename(file_path)}...")
         start_time = time.time()
         sha256_hash = hashlib.sha256()
@@ -69,97 +103,77 @@ class BaseCivitaiPromptStatsNode:
         return digest
 
     def get_cached_sha256(self, file_path):
-        """
-        获取文件的 SHA256 哈希，优先从缓存读取。
-        缓存键基于文件路径、修改时间和大小。
-        """
         try:
             mtime = os.path.getmtime(file_path)
             size = os.path.getsize(file_path)
             cache_key = f"{file_path}|{mtime}|{size}"
-
             try:
                 with open(self.HASH_CACHE_FILE, "r", encoding="utf-8") as f:
                     hash_cache = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 hash_cache = {}
-
             if cache_key in hash_cache:
                 print(f"[{self.__class__.__name__}] Loaded hash from cache for: {os.path.basename(file_path)}")
                 return hash_cache[cache_key]
-
             file_hash = self.calculate_sha256(file_path)
             hash_cache[cache_key] = file_hash
-
             with open(self.HASH_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(hash_cache, f, indent=2)
-
             return file_hash
         except Exception as e:
             print(f"[{self.__class__.__name__}] Error handling hash cache: {e}")
-            # Fallback to direct calculation if caching fails
             return self.calculate_sha256(file_path)
 
     @staticmethod
     def _get_model_version_info_by_hash(sha256_hash, timeout=10):
         url = f"https://civitai.com/api/v1/model-versions/by-hash/{sha256_hash}"
-        resp = requests.get(url, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            print(f"[{__class__.__name__}] Failed to fetch model version info by hash: {e}")
+            return None
 
     def _fetch_images_page(self, model_version_id, page, sort, timeout):
         url = "https://civitai.com/api/v1/images"
-        params = {"modelVersionId": model_version_id, "limit": 100, "page": page, "sort": sort}
+        params = {
+            "modelVersionId": model_version_id,
+            "limit": 100,
+            "page": page,
+            "sort": sort,
+        }
         resp = requests.get(url, params=params, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
 
     @staticmethod
     def _parse_prompts(prompt_text: str):
-        """
-        增强的提示词解析器，可以处理带权重的词组、LoRA等。
-        例如：(masterpiece:1.2), <lora:name:1>, [word1|word2]
-        """
         if not isinstance(prompt_text, str) or not prompt_text.strip():
             return []
-        # 正则表达式：匹配 <...>、[...]、(...) 或被逗号分隔的普通词组
         pattern = re.compile(r"<[^>]+>|\[[^\]]+\]|\([^)]+\)|[^,]+")
         tags = pattern.findall(prompt_text)
         return [tag.strip() for tag in tags if tag.strip()]
 
     def _format_tags_with_counts(self, items, top_n):
-        """
-        items: list of (tag, count)
-        output each line: index : "tag" (count)
-        """
-        out_lines = []
-        idx = 0
-        for tag, cnt in items:
-            if not tag:
-                continue
-            t = str(tag).strip()
-            if not t:
-                continue
-            out_lines.append(f'{idx} : "{t}" ({cnt})')
-            idx += 1
-            if idx >= top_n:
-                break
+        out_lines = [f'{i} : "{tag}" ({count})' for i, (tag, count) in enumerate(items[:top_n])]
         return "\n".join(out_lines)
 
-    def execute(self, file_name, top_n, max_pages, sort, timeout, retries, force_refresh):
+    def execute(
+        self, file_name, top_n, max_pages, sort, timeout, retries, force_refresh
+    ):
+        """This base execute method ONLY fetches community prompts."""
         file_path = folder_paths.get_full_path(self.FOLDER_KEY, file_name)
         if not file_path or not os.path.exists(file_path):
-            print(f"[{self.__class__.__name__}] 本地文件未找到: {file_path}")
+            print(f"[{self.__class__.__name__}] File not found: {file_path}")
             return ("", "")
 
-        # 优化1: 优先从缓存获取文件哈希
         try:
             file_hash = self.get_cached_sha256(file_path)
         except Exception as e:
-            print(f"[{self.__class__.__name__}] 计算或获取文件 hash 失败: {e}")
+            print(f"[{self.__class__.__name__}] Failed to get file hash: {e}")
             return ("", "")
 
-        # 优化2: 优化缓存键，移除 top_n
         cache_file = os.path.join(self.CACHE_DIR, f"{file_hash}_{sort}_{max_pages}.json")
         if force_refresh == "no" and os.path.exists(cache_file):
             try:
@@ -167,110 +181,152 @@ class BaseCivitaiPromptStatsNode:
                     cached_data = json.load(f)
                 pos_counts = cached_data.get("pos_counts", [])
                 neg_counts = cached_data.get("neg_counts", [])
-
-                # 直接使用缓存数据进行格式化输出
                 pos_text = self._format_tags_with_counts(pos_counts, top_n)
                 neg_text = self._format_tags_with_counts(neg_counts, top_n)
                 print(f"[{self.__class__.__name__}] Loaded prompt stats from cache: {os.path.basename(cache_file)}")
                 return (pos_text, neg_text)
             except Exception as e:
                 print(f"[{self.__class__.__name__}] Failed to load from cache, fetching new data. Error: {e}")
-                pass
 
-        # step1: get model version via hash
-        try:
-            model_info = self._get_model_version_info_by_hash(file_hash, timeout=timeout)
-        except Exception as e:
-            print(f"[{self.__class__.__name__}] 获取 model-version 失败: {e}")
+        model_info = self._get_model_version_info_by_hash(file_hash, timeout=timeout)
+        if not model_info or not model_info.get("id"):
+            print(f"[{self.__class__.__name__}] Could not find model info on Civitai.")
             return ("", "")
 
-        model_version_id = model_info.get("id") if isinstance(model_info, dict) else None
-        if not model_version_id:
-            print(f"[{self.__class__.__name__}] modelVersionId 未找到")
-            return ("", "")
+        model_version_id = model_info.get("id")
+        pages, pos_tokens, neg_tokens = range(1, max_pages + 1), [], []
+        sort_param = (sort if sort in ("Most Reactions", "Most Comments", "Newest") else "Newest")
 
-        # step2: fetch pages concurrently
-        pages = list(range(1, max_pages + 1))
-        pos_tokens, neg_tokens = [], []
-
-        sort_param = sort if sort in ("Most Reactions", "Most Comments", "Newest") else "Newest"
-
-        max_workers = min(10, max(1, len(pages)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
-            for p in pages:
-
-                def make_task(page_num):
-                    attempt = 0
-                    while True:
-                        try:
-                            return self._fetch_images_page(model_version_id, page_num, sort_param, timeout)
-                        except requests.Timeout:
-                            attempt += 1
-                            print(f"[{self.__class__.__name__}] Timeout page {page_num}, attempt {attempt}")
-                            if attempt > retries:
-                                return {"items": []}
-                            time.sleep(0.2)
-                        except requests.RequestException as e:
-                            attempt += 1
-                            print(f"[{self.__class__.__name__}] RequestException page {page_num}: {e} attempt {attempt}")
-                            if attempt > retries:
-                                return {"items": []}
-                            time.sleep(0.2)
-                        except Exception as e:
-                            print(f"[{self.__class__.__name__}] Unexpected error page {page_num}: {e}")
-                            return {"items": []}
-
-                futures[executor.submit(make_task, p)] = p
-
-            for fut in as_completed(futures):
-                data = fut.result()
-                items = data.get("items", []) if isinstance(data, dict) else []
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    meta = item.get("meta") or {}
-                    if not isinstance(meta, dict):
-                        continue
-                    prompt = meta.get("prompt") or ""
-                    negprompt = meta.get("negativePrompt") or ""
-
-                    # 优化3: 使用增强的解析器
-                    pos_tokens.extend(self._parse_prompts(prompt))
-                    neg_tokens.extend(self._parse_prompts(negprompt))
+        with ThreadPoolExecutor(max_workers=min(10, len(pages))) as executor:
+            future_to_page = {executor.submit(self._fetch_images_page, model_version_id, p, sort_param, timeout): p for p in pages}
+            for future in as_completed(future_to_page):
+                try:
+                    data = future.result()
+                    for item in data.get("items", []):
+                        if meta := item.get("meta", {}):
+                            pos_tokens.extend(self._parse_prompts(meta.get("prompt", "")))
+                            neg_tokens.extend(self._parse_prompts(meta.get("negativePrompt", "")))
+                except Exception as exc:
+                    print(f"[{self.__class__.__name__}] Page generated an exception: {exc}")
 
         pos_counts = Counter(pos_tokens).most_common()
         neg_counts = Counter(neg_tokens).most_common()
-
-        # 格式化输出
         pos_text = self._format_tags_with_counts(pos_counts, top_n)
         neg_text = self._format_tags_with_counts(neg_counts, top_n)
 
-        # 优化2: 缓存原始统计数据而非格式化文本
         try:
             with open(cache_file, "w", encoding="utf-8") as f:
-                cache_content = {"pos_counts": pos_counts, "neg_counts": neg_counts}
-                json.dump(cache_content, f, ensure_ascii=False, indent=2)
+                json.dump(
+                    {"pos_counts": pos_counts, "neg_counts": neg_counts},
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
         except Exception as e:
-            print(f"[{self.__class__.__name__}] 保存缓存失败: {e}")
+            print(f"[{self.__class__.__name__}] Failed to save cache: {e}")
 
         return (pos_text, neg_text)
 
+# --- Subclass for CKPT (Simple, inherits everything it needs) ---
 
-# 子类: CKPT
 class CivitaiPromptStatsCKPT(BaseCivitaiPromptStatsNode):
     FOLDER_KEY = "checkpoints"
 
-# 子类: LORA
+    # We can explicitly define these, but it inherits them from the base class anyway
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("positive_prompt", "negative_prompt")
+
+# --- Subclass for LORA (Adds its own logic and outputs) ---
+
 class CivitaiPromptStatsLORA(BaseCivitaiPromptStatsNode):
     FOLDER_KEY = "loras"
 
+    # LORA node has four outputs
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = (
+        "positive_prompt",
+        "negative_prompt",
+        "metadata_triggers",
+        "civitai_triggers",
+    )
 
-# 注册节点
+    def _get_civitai_triggers(self, file_name, file_hash, force_refresh):
+        """Gets trigger words from Civitai API and uses its own cache."""
+        try:
+            with open(self.CIVITAI_TRIGGERS_CACHE, "r", encoding="utf-8") as f:
+                trigger_cache = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            trigger_cache = {}
+
+        if force_refresh == "no" and file_name in trigger_cache:
+            print(f"[{self.__class__.__name__}] Loaded civitai triggers from cache for: {file_name}")
+            return trigger_cache[file_name]
+
+        print(f"[{self.__class__.__name__}] Requesting civitai triggers from API for: {file_name}")
+        model_info = self._get_model_version_info_by_hash(file_hash)
+        triggers = (
+            model_info.get("trainedWords", [])
+            if model_info and isinstance(model_info.get("trainedWords"), list)
+            else []
+        )
+
+        trigger_cache[file_name] = triggers
+        try:
+            with open(self.CIVITAI_TRIGGERS_CACHE, "w", encoding="utf-8") as f:
+                json.dump(trigger_cache, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[{self.__class__.__name__}] Failed to save civitai triggers cache: {e}")
+
+        return triggers
+
+    def execute(
+        self, file_name, top_n, max_pages, sort, timeout, retries, force_refresh
+    ):
+        """LORA-specific execute method that adds trigger word fetching."""
+
+        # --- Step 1: Perform LORA-specific logic (get trigger words) ---
+        file_path = folder_paths.get_full_path(self.FOLDER_KEY, file_name)
+        if not file_path or not os.path.exists(file_path):
+            print(f"[{self.__class__.__name__}] File not found: {file_path}")
+            return ("", "", "", "")
+
+        # Source 1: Local file metadata
+        metadata = get_metadata(file_name, self.FOLDER_KEY)
+        metadata_triggers_list = sort_tags_by_frequency(metadata)
+
+        # Source 2: Civitai API (trainedWords)
+        civitai_triggers_list = []
+        try:
+            file_hash = self.get_cached_sha256(file_path)
+            civitai_triggers_list = self._get_civitai_triggers(file_name, file_hash, force_refresh)
+        except Exception as e:
+            print(f"[{self.__class__.__name__}] Failed to get file hash for civitai triggers: {e}")
+
+        metadata_triggers_str = (
+            ", ".join(metadata_triggers_list)
+            if metadata_triggers_list
+            else "[空: 未在模型元数据中找到触发词]"
+        )
+        civitai_triggers_str = (
+            ", ".join(civitai_triggers_list)
+            if civitai_triggers_list
+            else "[空: 未在 Civitai API 中找到触发词]"
+        )
+
+        # --- Step 2: Call the base class's execute method to get common data ---
+        # This reuses all the logic for fetching community prompts
+        pos_text, neg_text = super().execute(file_name, top_n, max_pages, sort, timeout, retries, force_refresh)
+
+        # --- Step 3: Combine and return all results ---
+        return (pos_text, neg_text, metadata_triggers_str, civitai_triggers_str)
+
+# --- Node Mappings ---
+
 NODE_CLASS_MAPPINGS = {
     "CivitaiPromptStatsCKPT": CivitaiPromptStatsCKPT,
     "CivitaiPromptStatsLORA": CivitaiPromptStatsLORA,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CivitaiPromptStatsCKPT": "Civitai Prompt Stats (CKPT)",
     "CivitaiPromptStatsLORA": "Civitai Prompt Stats (LORA)",

@@ -1,14 +1,20 @@
 [project]
-name = "comfyui_civitai_prompt_stats"
+name = "civitai_prompt_stats"
 description = "A ComfyUI node that quickly fetches the most commonly used positive and negative prompts for Civitai models (Checkpoint / Lora) from the community, helping you effortlessly enhance your own creations!(ComfyUI 节点，让你快速获取 Civitai 模型（Checkpoint / Lora）在社区中最常用的正向与负向 Prompt，轻松优化和提升自己的创作！)"
-version = "0.0.2"
-license = "MIT"
+version = "0.1.0"
+license = {file = "LICENSE"}
 
 [project.urls]
 Repository = "https://github.com/BAIKEMARK/ComfyUI_Civitai_Prompt_Stats"
-#  Used by Comfy Registry https://comfyregistry.org
+#  Used by Comfy Registry https://registry.comfy.org
+Documentation = "https://github.com/BAIKEMARK/ComfyUI_Civitai_Prompt_Stats/wiki"
+"Bug Tracker" = "https://github.com/BAIKEMARK/ComfyUI_Civitai_Prompt_Stats/issues"
 
+[tool]
 [tool.comfy]
-PublisherId = "BAIKEMARK"
+PublisherId = "baike-mark"
 DisplayName = "ComfyUI_Civitai_Prompt_Stats"
 Icon = ""
+includes = []
+# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+

@@ -111,7 +111,6 @@ yarn-debug.log*
 yarn-error.log*
 node.zip
 .vscode/
-.github/
 .idea/
 .claude/
 /data/
