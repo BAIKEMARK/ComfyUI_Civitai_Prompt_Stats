@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=70.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ComfyUI_Civitai_Prompt_Stats"
+version = "0.0.1"
+description = "A ComfyUI node that quickly fetches the most commonly used positive and negative prompts for Civitai models (Checkpoint / Lora) from the community, helping you effortlessly enhance your own creations!(ComfyUI 节点，让你快速获取 Civitai 模型（Checkpoint / Lora）在社区中最常用的正向与负向 Prompt，轻松优化和提升自己的创作！)"
+authors = [
+  {name = "ComfyUI_Civitai_Prompt_Stats", email = "zdl510510@126.com"}
+]
+readme = "README.md"
+license = {text = "MIT license"}
+requires-python = ">=3.10"
+classifiers = []
+dependencies = [
+
+]
+
+
+
+[project.optional-dependencies]
+dev = [
+    "bump-my-version",
+    "coverage",  # testing
+    "mypy",  # linting
+    "pre-commit", # runs linting on commit
+    "pytest",  # testing
+    "ruff",  # linting
+]
+
+[project.urls]
+Repository = "https://github.com/BAIKEMARK/ComfyUI_Civitai_Prompt_Stats"
+BugTracker = "https://github.com/BAIKEMARK/ComfyUI_Civitai_Prompt_Stats/issues"
+Documentation = "https://github.com/BAIKEMARK/ComfyUI_Civitai_Prompt_Stats/wiki"
+
+
+[tool.comfy]
+PublisherId = "BAIKEMARK"
+DisplayName = "ComfyUI_Civitai_Prompt_Stats"
+Icon = ""
+Tags = []
+Repository = "https://github.com/BAIKEMARK/ComfyUI_Civitai_Prompt_Stats"
+
+includes = []
+
+[tool.setuptools.package-data]
+"*" = ["*.*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = [
+    "tests",
+]
+
+[tool.mypy]
+files = "."
+
+# Use strict defaults
+strict = true
+warn_unreachable = true
+warn_no_return = true
+
+[[tool.mypy.overrides]]
+# Don't require test functions to include types
+module = "tests.*"
+allow_untyped_defs = true
+disable_error_code = "attr-defined"
+
+[tool.ruff]
+# extend-exclude = ["static", "ci/templates"]
+line-length = 140
+src = ["src", "tests"]
+target-version = "py39"
+
+# Add rules to ban exec/eval
+[tool.ruff.lint]
+select = [
+    "S102",  # exec-builtin
+    "S307",  # eval-used
+    "W293",
+    "F",  # The "F" series in Ruff stands for "Pyflakes" rules, which catch various Python syntax errors and undefined names.
+    # See all rules here: https://docs.astral.sh/ruff/rules/#pyflakes-f
+]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "double"
